@@ -1033,25 +1033,30 @@ let check_enabled_axioms_usage = object (self: 'self)
             super#step scx st
 
     method check_usable pf (_, cx) usables only =
+        (* Set `found_enabled_axioms` if some fact in the context refers to the
+           `ENABLEDaxioms` pragma.  In the context (a telescope whose front,
+           as visited by `Deque.iter`, is the outermost binder), the fact at
+           front-index `fi` whose body is `Ix k` refers to the hypothesis at
+           front-index `fi - k`.  This equals the original
+           `get_val_from_id (cx_front cx (size - fi)) k`, but is computed in two
+           linear passes instead of recomputing `cx_front` (O(context)) for
+           every fact.  The previous O(context * #facts) scan ran for every
+           `BY`/`OBVIOUS` and dominated elaboration on `INSTANCE`-heavy modules,
+           whose contexts carry hundreds of imported facts. *)
+        let size = Deque.size cx in
+        let is_pragma = Array.make (size + 1) false in
+        Deque.iter begin fun fi h -> match h.core with
+          | Defn ({core = Bpragma (name, _, _)}, _, _, _)
+            when name.core = "ENABLEDaxioms" -> is_pragma.(fi) <- true
+          | _ -> ()
+        end cx;
         let found = ref false in
-        (* find proof directive in the context *)
-        let cx_iter n hyp =
-            match hyp.core with
-            | Fact (expr, _, _) ->
-                let cx_ = Expr.T.cx_front cx ((Deque.size cx) - n) in
-                begin match expr.core with
-                | Ix n -> begin
-                    let hyp = E_t.get_val_from_id cx_ n in
-                    match hyp.core with
-                    | Defn ({core=Bpragma (name, _, _)}, _, _, _) ->
-                        found := !found || (name.core = "ENABLEDaxioms")
-                    | _ -> ()
-                    end
-                | _ -> ()
-                end
-            | _ -> ()
-            in
-        Deque.iter cx_iter cx;
+        Deque.iter begin fun fi h -> match h.core with
+          | Fact ({core = Ix k}, _, _) ->
+              let t = fi - k in
+              if t >= 0 && t < size && is_pragma.(t) then found := true
+          | _ -> ()
+        end cx;
         if !found then begin
             found_enabled_axioms <- true;
             end
