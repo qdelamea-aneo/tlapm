@@ -36,22 +36,42 @@ let vprintf fmt =
     Printf.ifprintf stderr fmt
 
 let expand_defs ?(what = fun _ -> true) ob =
-  let rec visit sq =
-    match Deque.front sq.context with
-    | None -> sq
-    | Some (h, hs) -> begin
-        match h.core with
-          | Defn ({core = Operator (nm, e)}, wd, Visible, _) when what wd ->
-              visit (app_sequent (scons e (shift 0)) { sq with context = hs })
+  (* Inline the visible operator / pragma definitions of the obligation's
+     context into the rest of the sequent.
+
+     The previous formulation recursed front-to-back and, for *each* expanded
+     definition, applied `app_sequent (scons e (shift 0))` to the whole
+     remaining sequent.  That rebuilds the entire (potentially huge) sequent
+     once per expanded definition -- O(#expanded-defs * sequent-size) work and
+     allocation.  On `INSTANCE`-heavy modules a single obligation can carry
+     thousands of context hypotheses with hundreds of visible definitions, so
+     this dominated backend preparation.
+
+     This formulation makes a single front-to-back pass, accumulating one
+     substitution `s` (exactly the composition the iterated version applied
+     step by step) and rebuilding the sequent only once.  Each hypothesis is
+     translated by the current `s` with `app_hyp`; a visible definition is
+     dropped and its (already-translated) body is `scons`-ed onto `s`; any
+     other hypothesis is kept (with `s` bumped past its binder).  Because it
+     reuses `app_hyp`/`app_expr`, the De Bruijn framing -- and hence the
+     resulting obligation -- is identical to the previous version. *)
+  let sq = ob.obl.core in
+  let rec fold s kept cx = match Deque.front cx with
+    | None -> (s, kept)
+    | Some (h, hs) ->
+        let h = app_hyp s h in
+        begin match h.core with
+          | Defn ({core = Operator (_, e)}, wd, Visible, _) when what wd ->
+              fold (scons e s) kept hs
           | Defn ({core = Bpragma (_, e, _)}, wd, _, _) when what wd ->
-              visit (app_sequent (scons e (shift 0)) { sq with context = hs })
+              fold (scons e s) kept hs
           | _ ->
-              let sq = visit { sq with context = hs } in
-                { sq with context = Deque.cons h sq.context }
-      end
+              fold (bump s) (Deque.snoc kept h) hs
+        end
   in
-  let obl = visit ob.obl.core in
-     { ob with obl = { ob.obl with core = obl } }
+  let (s, context) = fold (shift 0) Deque.empty sq.context in
+  let active = app_expr s sq.active in
+  { ob with obl = { ob.obl with core = { context ; active } } }
 
 (*
 let expand_defs ?(what = fun _ -> true) ob =
