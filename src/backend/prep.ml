@@ -947,6 +947,75 @@ let obl_from_expr
     | _ -> failwith "Backend.Prep.obl_from_expr"
 
 
+let prune_context ob =
+  (* Drop context hypotheses the obligation cannot reach.
+
+     After `expand_defs` has inlined the visible definitions, the obligation
+     still carries every hidden definition and fact imported by `INSTANCE` --
+     most of which a given goal never references.  This pass keeps only the
+     hypotheses transitively reachable, via de Bruijn references, from the goal
+     and the facts, and drops the rest, renumbering with the same
+     substitution machinery as `expand_defs`.
+
+     Only UNREFERENCED HIDDEN operator/pragma definitions are dropped: a hidden
+     definition is an opaque declaration, so when nothing (transitively) refers
+     to it the backends never see it, and dropping it preserves provability.
+     Everything else is kept -- all declarations (`Fresh`/`Flex`/`FreshTuply`),
+     recursive/instance definitions, and ALL facts (including hidden ones, which
+     remain available as premises and were found to be needed); un-analyzable
+     hypotheses conservatively keep all their predecessors.
+
+     Self-checking: a dropped slot is filled with a distinctive
+     `Opaque "__pruned__"`.  Because dropped hypotheses are unreachable, it
+     never appears in the result; a reachability bug would surface as that
+     opaque leaking into an obligation (a failing proof), never as a silent
+     miscompilation. *)
+  let sq = ob.obl.core in
+  let n = Deque.size sq.context in
+  if n = 0 then ob else begin
+    let arr = Array.of_list (Deque.to_list sq.context) in  (* arr.(0) = front *)
+    let keep = Array.make n false in
+    let mark m fv =
+      (* mark the positions referenced by free indices `fv` of a node whose
+         enclosing context has size `m` (de Bruijn index k -> position m - k) *)
+      Util.Coll.Is.iter
+        (fun k -> let pos = m - k in if pos >= 0 && pos < n then keep.(pos) <- true)
+        fv
+    in
+    let mark_all_before p = for q = 0 to p - 1 do keep.(q) <- true done in
+    (* seed: keep everything except hidden operator/pragma definitions *)
+    for p = 0 to n - 1 do
+      (match arr.(p).core with
+        | Defn ({core = (Operator _ | Bpragma _)}, _, Hidden, _) -> ()
+        | _ -> keep.(p) <- true)
+    done;
+    (* the goal references hypotheses at any depth *)
+    mark n (Expr.Collect.fvs sq.active);
+    (* close: references point strictly front-ward, so one rear-to-front pass
+       reaches the transitive closure *)
+    for p = n - 1 downto 0 do
+      if keep.(p) then begin
+        match arr.(p).core with
+          | Defn ({core = Operator (_, e)}, _, _, _)
+          | Defn ({core = Bpragma (_, e, _)}, _, _, _) -> mark p (Expr.Collect.fvs e)
+          | Fact (e, _, _) -> mark p (Expr.Collect.fvs e)
+          | Fresh (_, _, _, Bounded (dom, _)) -> mark p (Expr.Collect.fvs dom)
+          | Fresh _ | Flex _ | Defn ({core = Recursive _}, _, _, _) -> ()
+          | _ -> mark_all_before p
+      end
+    done;
+    (* rebuild: `bump s` under a kept hypothesis, `scons placeholder s` to drop *)
+    let rec fold s i kept cx = match Deque.front cx with
+      | None -> (s, kept)
+      | Some (h, hs) ->
+          if keep.(i) then fold (bump s) (i + 1) (Deque.snoc kept (app_hyp s h)) hs
+          else fold (scons (Opaque "__pruned__" @@ h) s) (i + 1) kept hs
+    in
+    let (s, context) = fold (shift 0) 0 Deque.empty sq.context in
+    let active = app_expr s sq.active in
+    { ob with obl = { ob.obl with core = { context ; active } } }
+  end
+
 let normalize_expr ob =
     print_obl_and_msg ob (
         "Proof obligation before `Backend.Prep.expand_defs`:\n");
@@ -1047,6 +1116,12 @@ let normalize_expand ob fpout thyout record
             ~apply_lambdify:apply_lambdify
             ~enabled_axioms:enabled_axioms
             ~level_comparison:level_comparison in
+        (* Prune unreachable hidden definitions only after every expansion
+           (`expand_defs`, `Expr.Elab.normalize`, and the ENABLED/`\cdot`
+           expansion above) has introduced its references, so that nothing
+           still needed -- in particular by the ENABLED/`\cdot` soundness
+           machinery -- is dropped. *)
+        let ob = prune_context ob in
         (ob, true)
     with Failure msg ->
         (* `msg` is the message from soundness checks,
