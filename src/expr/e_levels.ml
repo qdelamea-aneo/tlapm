@@ -112,6 +112,50 @@ let make_level_info_arity (level: int) (arity: int) =
     let weights = make_weights arity in
     LevelInfo (level, weights, level_args)
 
+let hyp_level_info_direct h =
+    (* Level info of hypothesis `h`, when it can be determined WITHOUT
+    visiting/recomputing the hypothesis (i.e. without a context slice and
+    without recursion).  Returns `None` when a full visit is required.
+
+    This mirrors exactly the `level_info` local function of
+    `level_computation#hyp` below, but only for the cases whose answer does
+    not depend on first re-leveling the hypothesis:
+
+    - declared identifiers (`Flex`, `Fresh`) have an intrinsic, kind-based
+      level (the domain of a bounded `Fresh` does not affect the declared
+      identifier's own level);
+    - a defined operator (`Defn`) or a fact (`Fact`) whose body already carries
+      level information can be read directly; `level_computation#hyp` would
+      re-level it, but re-leveling an already-leveled node is a no-op and
+      yields the same `level_info`.
+
+    Used by the `Ix` case of `level_computation#expr` to avoid the O(context)
+    `E_t.scx_front` slice and the recursion into definition bodies on every
+    De Bruijn reference. *)
+    match h.core with
+    | Flex _ ->
+        Some (make_level_info 1)
+    | Fresh (name, op_shape, kind, _) ->
+        let level = match kind with
+            | Constant -> 0
+            | State -> 1
+            | Action -> 2
+            | Temporal -> 3
+            | Unknown -> 0
+            in
+        let weights = match op_shape with
+            | Shape_expr -> []
+            | Shape_op arity -> assert (arity >= 1); make_weights arity
+            in
+        let level_args = StringSet.singleton name.core in
+        Some (LevelInfo (level, weights, level_args))
+    | Defn (df, _, _, _) when has_level df ->
+        Some (get_level_info df)
+    | Fact (e, _, _) when has_level e ->
+        Some (get_level_info e)
+    | _ ->
+        None
+
 
 let assert_has_correct_level expr =
     let (e_level: int) = get_level expr in
@@ -283,39 +327,23 @@ class virtual ['s] level_computation = object (self : 'self)
         | Ix n -> begin
             assert (n >= 1);
             let hyp = E_t.get_val_from_id cx n in
-            let e_level_info = match hyp.core with
-                | Fresh _
-                | Flex _
-                | Defn _ ->
-                    (* For definitions, this call can recurse in the body
-                    of the definition. If the level computation has been
-                    called on a sequent, then level information for all
-                    definitions in the context `cx` has been computed,
-                    so this call will return after finding the level
-                    information in the property that annotates the
+            let e_level_info = match hyp_level_info_direct hyp with
+                | Some level_info ->
+                    (* Fast path: the level is determinable without slicing
+                    the context or recursing into the hypothesis (declared
+                    identifiers, and already-leveled definitions/facts). *)
+                    level_info
+                | None ->
+                    (* Slow path (unchanged).  For definitions, this call can
+                    recurse in the body of the definition. If the level
+                    computation has been called on a sequent, then level
+                    information for all definitions in the context `cx` has
+                    been computed, so this call will return after finding the
+                    level information in the property that annotates the
                     definition. *)
                     let hyp_scx = E_t.scx_front scx n in
                     let (_, e_) = self#hyp hyp_scx hyp in
                     get_level_info e_
-                | FreshTuply _ ->
-                    assert false  (* not implemented *)
-                | Fact (e_, _, _) ->
-                    (*
-                    E_t.print_cx cx;
-                    print_string "Index in context:\n";
-                    print_int n;
-                    Util.eprintf ~at:e "%s"
-                        (let hyp_cx = E_t.cx_front cx n in
-                        (E_fmt.string_of_expr hyp_cx e));
-                    *)
-                    let hyp_scx = E_t.scx_front scx n in
-                    let (_, e_) = self#hyp hyp_scx hyp in
-                    get_level_info e_
-                    (*
-                    assert false  (* A de Bruijn index
-                        refers to a declared or defined operator.
-                        *)
-                    *)
                 in
             assign e exprlevel e_level_info
             end
