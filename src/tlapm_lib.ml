@@ -409,6 +409,67 @@ let process_module
                 fin with final_obs = Array.of_list obs ;
                 final_status = (Incomplete, summ) } in
         t.core.stage <- Final fin ;
+        (* ---- BEGIN LOCAL/INSTANCE scope instrumentation (env-gated) ----
+           Counts, across every proof obligation of this module, the `Defn`
+           hypotheses that make up the obligation context that is handed to the
+           backends, broken down by visibility (Visible/Hidden) and by export
+           (Local/Export). This makes it possible to compare, quantitatively,
+           what an `INSTANCE` vs a `LOCAL INSTANCE` actually injects into the
+           obligations. Enable with TLAPM_TRACE_DEFS=1. *)
+        (match Sys.getenv_opt "TLAPM_TRACE_DEFS" with
+         | None -> ()
+         | Some _ ->
+            let open Expr.T in
+            let n_obl = Array.length fin.final_obs in
+            let t_defn = ref 0 and t_vis_op = ref 0 and t_hid_op = ref 0
+            and t_bpragma = ref 0 and t_local = ref 0 and t_export = ref 0
+            and t_ctx = ref 0 and max_ctx = ref 0 in
+            (* per-instance-prefix dead-weight tally: how many context defs come
+               from each refinement instance (by operator-name substring) *)
+            let prefixes = ["TP1!"; "OP1!"; "TP2!"; "OP2!"; "GP1!"] in
+            let by_prefix = List.map (fun p -> (p, ref 0)) prefixes in
+            let contains hay needle =
+              let nh = String.length needle and lh = String.length hay in
+              let rec go i =
+                if i + nh > lh then false
+                else if String.sub hay i nh = needle then true
+                else go (i + 1) in
+              go 0 in
+            let bump_prefix nm =
+              List.iter (fun (p, r) -> if contains nm p then incr r) by_prefix in
+            Array.iter (fun ob ->
+              let ctx = Deque.to_list ob.obl.core.context in
+              let this_ctx = List.length ctx in
+              t_ctx := !t_ctx + this_ctx ;
+              if this_ctx > !max_ctx then max_ctx := this_ctx ;
+              List.iter (fun h ->
+                match h.core with
+                | Defn (df, _wd, vis, ex) ->
+                    incr t_defn ;
+                    (match ex with
+                     | Local -> incr t_local
+                     | Export -> incr t_export) ;
+                    (match df.core, vis with
+                     | Operator (nm, _), Visible -> incr t_vis_op ; bump_prefix nm.core
+                     | Operator (nm, _), Hidden -> incr t_hid_op ; bump_prefix nm.core
+                     | Bpragma (nm, _, _), _ -> incr t_bpragma ; bump_prefix nm.core
+                     | _ -> ())
+                | _ -> ()
+              ) ctx
+            ) fin.final_obs ;
+            Printf.eprintf
+              "[TRACE_DEFS] module=%s important=%b obligations=%d \
+               total_ctx_hyps=%d max_ctx_hyps=%d Defn=%d \
+               (Visible_op=%d Hidden_op=%d Bpragma=%d) \
+               export[Local=%d Export=%d] expandable~=%d\n%!"
+              t.core.name.core t.core.important n_obl
+              !t_ctx !max_ctx !t_defn
+              !t_vis_op !t_hid_op !t_bpragma
+              !t_local !t_export (!t_vis_op + !t_bpragma) ;
+            Printf.eprintf "[TRACE_DEFS]   by-instance-prefix (ctx-def occurrences): %s\n%!"
+              (String.concat "  "
+                 (List.map (fun (p, r) -> Printf.sprintf "%s=%d" p !r) by_prefix))) ;
+        (* ---- END instrumentation ---- *)
         Module.Save.store_module ~clock:Clocks.elab t ;
         (mcx, t)
     in
