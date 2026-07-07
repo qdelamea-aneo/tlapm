@@ -23,9 +23,17 @@ module IM = EMap (struct
                     type t = ident
                     let compare = Stdlib.compare
                   end)
+module PM = EMap (struct
+                    type t = int
+                    let compare = Stdlib.compare
+                  end)
 
 type 'a ctx = {
   linrep : (ident * 'a option) list ;
+  posrep : (ident * 'a option) PM.t ;
+    (* same entries as [linrep], keyed by position from the bottom
+       (oldest = 1), so that [index] is a logarithmic lookup instead of
+       a [List.nth] walk *)
   idents : ident M.t ;
   defns  : ('a option * int) M.t ;
   length : int ;
@@ -33,6 +41,7 @@ type 'a ctx = {
 }
 
 let dot = { linrep = [] ;
+            posrep = PM.empty ;
             idents = M.empty ;
             defns  = M.empty ;
             length = 0 ;
@@ -48,6 +57,7 @@ let alter cx n how =
         let x = how id x in
         { cx with
             linrep = backs @ ((id, Some x) :: fronts) ;
+            posrep = PM.add (cx.length - n + 1) (id, Some x) cx.posrep ;
             defns = M.add (string_of_ident id) (Some x, n) cx.defns }
     | _ -> failwith "Ctx.alter"
 
@@ -56,11 +66,15 @@ let map cx fn =
     | (id, None) -> (id, None)
     | (id, Some x) -> (id, Some (fn (n + 1) x))
   end cx.linrep in
+  let pr = PM.mapi begin fun p -> function
+    | (id, None) -> (id, None)
+    | (id, Some x) -> (id, Some (fn (cx.length - p + 1) x))
+  end cx.posrep in
   let ds = M.map begin function
     | (None, n) -> (None, n)
     | (Some x, n) -> (Some (fn n x), n)
   end cx.defns in
-  { cx with linrep = lr ; defns = ds }
+  { cx with linrep = lr ; posrep = pr ; defns = ds }
 
 let mem ident cx = M.mem ident cx.idents
 
@@ -79,6 +93,7 @@ let maybe_adj cx v a =
   let id = find_id id in
     { cx with
       linrep = (id, a) :: cx.linrep ;
+      posrep = PM.add (cx.length + 1) (id, a) cx.posrep ;
       idents = M.add v id cx.idents ;
       defns  = M.add (string_of_ident id) (a, cx.length) cx.defns ;
       length = cx.length + 1}
@@ -110,7 +125,13 @@ let to_list cx =
 
 open Format
 
-let index cx n = List.nth cx.linrep (n - 1)
+let index cx n =
+  (* logarithmic replacement for [List.nth cx.linrep (n - 1)], with the
+     same exception behavior as [List.nth] *)
+  if n <= 0 then invalid_arg "List.nth"
+  else match PM.maybe_find (cx.length - n + 1) cx.posrep with
+    | Some e -> e
+    | None -> failwith "nth"
 
 let top cx = match cx.linrep with
   | [] -> failwith "Ctx.top"

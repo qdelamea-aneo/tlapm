@@ -136,6 +136,33 @@ let run max_threads tl =
     (* Then compute the next deadline. *)
     let dl = List.fold_left (fun x y -> min x y.dl) infinity running in
     if tl <> [] && List.length running < max_threads && now < dl then begin
+      (* Reap already-finished processes before launching the next task:
+         constructing a task (encoding an obligation for its prover) can
+         take seconds, during which a prover that already exited would
+         otherwise sit unread past its deadline and be reported as a
+         spurious timeout. A zero-timeout select costs nothing. *)
+      let (running, tl) =
+        if running = [] then (running, tl)
+        else begin
+          let outs = List.map (fun x -> x.ofd) running in
+          let (ready, _, _) = Unix.select outs [] [] 0.0 in
+          if ready = [] then (running, tl)
+          else begin
+            let now = Unix.gettimeofday () in
+            let f d =
+              if List.mem d.ofd ready then begin
+                try
+                  read_to_stdout d.ofd;
+                  [d], []
+                with End_of_file -> kill_and_start_next now Finished d
+              end else
+                [d], []
+            in
+            let newruns, addtasks = List.split (List.map f running) in
+            (List.flatten newruns, List.flatten addtasks @ tl)
+          end
+        end
+      in
       (* Then launch new tasks from the task list. This can take time, so
          do it only until the deadline is up. *)
       match tl with
@@ -147,6 +174,10 @@ let run max_threads tl =
       let delay = max 0.0 (min (dl -. Unix.gettimeofday ()) 60.0) in
       let outs = if !Params.toolbox then Unix.stdin :: outs else outs in
       let (ready, _, _) = Unix.select outs [] [] delay in
+      (* Refresh the clock: select may have slept up to [delay]; dating
+         reaps and deadline checks with the stale pre-select timestamp
+         under-reports run times and postpones kills. *)
+      let now = Unix.gettimeofday () in
 
       (* outputs *)
       let f d =

@@ -94,7 +94,7 @@ let prepend_list l q =
       front = l @ q.front ;
       flen = q.flen + n }
 
-let rec nth ?(backwards=false) q n =
+let nth ?(backwards=false) q n =
   (* Return item `n` from `q`.
 
   Define `m == (size q) - 1`.
@@ -108,40 +108,49 @@ let rec nth ?(backwards=false) q n =
   so the indexing becomes:
 
     m, m - 1, ..., 0
-  *)
-  if backwards then nth (rev q) n
-  else if n >= size q then None
-  else
-    let rec git q n =
-      match front q with
-        | Some (x, q) ->
-            if n = 0 then Some x else git q (n - 1)
-        | None ->
-            failwith "Deque.nth: internal error"
-    in
-    git q n
 
-let rec first_n q n =
+  Direct list indexing: forward positions [0, flen) live in `front` in
+  order; forward position p >= flen lives in `rear` (which is stored
+  reversed) at index (size - 1 - p).  This allocates nothing, unlike
+  popping with `front` which reverses the whole rear on first use.
+  Exception behavior matches the previous popping implementation:
+  n >= size gives None, negative n gives Failure. *)
+  if n >= size q then None
+  else if n < 0 then failwith "Deque.nth: internal error"
+  else
+    let n = if backwards then size q - 1 - n else n in
+    if n < q.flen then Some (List.nth q.front n)
+    else Some (List.nth q.rear (size q - 1 - n))
+
+let first_n q n =
     (* Return the first `n` elements of the queue `q`. *)
     if (n < 0) then
         failwith (Printf.sprintf "Deque.first_n:  n = %d < 0" n);
     if (n > (size q)) then
         failwith (Printf.sprintf "Deque.first_n:  n = %d > size q = %d" n (size q));
-    let rec f q n =
-        assert (n <= size q);
-        assert (n >= 0);
-        match n with
-        | 0 -> empty
-        | _ -> begin match front q with
-            | None -> assert false
-            | Some (x, q) ->
-                let r = f q (n - 1) in
-                cons x r
-            end
+    (* Share structure instead of popping every element (which reversed
+       the whole rear into fresh cells and re-consed the result):
+       - n <= flen: copy the first n cells of `front`;
+       - n > flen: keep `front` as-is and share the suffix of `rear`
+         (dropping its first size-n cells, which hold the forward tail
+         in reverse), allocating nothing beyond the record. *)
+    let rec take k l =
+        if k = 0 then []
+        else match l with
+            | x :: l -> x :: take (k - 1) l
+            | [] -> assert false
     in
-    (* TODO: move this unit test *)
-    (* assert ((size (f empty 0)) == 0); *)
-    f q n
+    let rec drop k l =
+        if k = 0 then l
+        else match l with
+            | _ :: l -> drop (k - 1) l
+            | [] -> assert false
+    in
+    if n <= q.flen then
+        { front = take n q.front ; flen = n ; rear = [] ; rlen = 0 }
+    else
+        { front = q.front ; flen = q.flen ;
+          rear = drop (size q - n) q.rear ; rlen = n - q.flen }
 
 
 let map f q =
@@ -209,6 +218,7 @@ let alter ?(backwards=false) q n alt_fn =
 
 (* Compare deques `q1` and `q2`, using `cmp` to compare their elements. *)
 let equal cmp q1 q2 =
+  q1 == q2 ||
   let rec diff l1 l2 =
     match l1, l2 with
     | x1 :: ll1, x2 :: ll2 when cmp x1 x2 -> diff ll1 ll2
