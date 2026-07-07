@@ -158,16 +158,26 @@ and app_x s (trail, res) =
    app_expr s res)
 
 (* [PERF] this is the hottest function in the PM (ignoring GC) *)
-and app_ix s n = match s with
-  | Shift m -> Ix (m + n.core) @@ n
-  | Cons (op, _) when n.core = 1 -> op.core @@ n  (* app_ix Cons(op, s) (1 @@ oe) = op.core @@ oe *)
-  | Cons (_, s) -> app_ix s (n.core - 1 @@ n)  (* app_ix Cons(op, s) (i @@ oe) = app_ix s ((i - 1) @@ oe) *)
-  | Compose (ss, tt) -> app_expr ss (app_ix tt n)
-    (* `app_ix` returns `Ix` so could call `app_ix` directly,
-    instead of `app_expr` *)
-  | Bump (k, ss) when n.core <= k -> Ix n.core @@ n
-  | Bump (k, ss) -> app_expr (Shift k) (app_ix ss (n.core - k @@ n))
-    (* could call `app_ix` directly, instead of `app_expr` *)
+and app_ix s n =
+  (* Walk the substitution spine with a plain int counter instead of
+     re-wrapping the index at every step: the intermediate wrapped ints
+     of the recursive form all carried `n`'s properties, and every
+     terminal case built its result from the current wrapper, so
+     constructing only the terminal value from `n` is equivalent.  On
+     deep `Cons` spines (e.g. the single-pass expand_defs substitution)
+     this removes one allocation per spine step. *)
+  let rec go s i = match s with
+    | Shift m -> Ix (m + i) @@ n
+    | Cons (op, _) when i = 1 -> op.core @@ n  (* app_ix Cons(op, s) (1 @@ oe) = op.core @@ oe *)
+    | Cons (_, s) -> go s (i - 1)  (* app_ix Cons(op, s) (i @@ oe) = app_ix s ((i - 1) @@ oe) *)
+    | Compose (ss, tt) -> app_expr ss (go tt i)
+      (* `app_ix` returns `Ix` so could call `app_ix` directly,
+      instead of `app_expr` *)
+    | Bump (k, _) when i <= k -> Ix i @@ n
+    | Bump (k, ss) -> app_expr (Shift k) (go ss (i - k))
+      (* could call `app_ix` directly, instead of `app_expr` *)
+  in
+  go s n.core
 
 and app_defn s d =
   { d with core = app_defn_ s d.core }

@@ -132,7 +132,11 @@ let flatten ob =
             prefix := Deque.snoc !prefix (Fact (app_expr (shift (n + k)) eq, Visible, tm) @@ h)
         end eqs ;
         let sq = { sq with context = cx } in
-        let sq = app_sequent (shift (List.length eqs + k - 1)) sq in
+        (* shift 0 is the common no-equalities-extracted case: skip the
+           full sequent rebuild (the input is beta-normal here, so the
+           rebuild is the identity) *)
+        let m = List.length eqs + k - 1 in
+        let sq = if m = 0 then sq else app_sequent (shift m) sq in
         rewrite sq
       end
     | Some (h, cx) ->
@@ -457,7 +461,11 @@ let gen_smt_solve ?(rlimit=None) suffix exec desc fmt_expr meth ob org_ob f res_
       fmt_expr Format.str_formatter ob;
       Format.flush_str_formatter ()
       in
-    pp_print_ob ~comm:comm inc ob;
+    (* The pretty-printed obligation header is a debugging aid for humans
+       reading the solver input file; solvers ignore it.  Printing it costs
+       a full Proof.Fmt render plus a regex pass per attempt, so only emit
+       it when the temp files are actually kept. *)
+    if Params.debugging "tempfiles" then pp_print_ob ~comm:comm inc ob;
     (* A deterministic Z3 `rlimit` budget makes the pass/fail outcome
        independent of CPU speed and load, so it reproduces on any machine and
        every rerun (see issue #281). It is a Z3 mechanism, hence only emitted

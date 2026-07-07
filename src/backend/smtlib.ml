@@ -59,13 +59,31 @@ let repls =
   ]
 
 let escaped =
-  List.fold_right begin fun (c, repl) ->
-    let rgx = Str.regexp (Str.quote (String.make 1 c)) in
-    Str.global_replace rgx repl
-  end repls
+  (* Compile the regexes once: the previous partial-application form
+     recompiled all 22 regexes on every call, which dominates printing
+     time on obligations with many identifiers. Same list order, same
+     replacements, hence byte-identical output. *)
+  let repls_rgx =
+    List.map begin fun (c, repl) ->
+      (Str.regexp (Str.quote (String.make 1 c)), repl)
+    end repls
+  in
+  fun s ->
+    List.fold_right begin fun (rgx, repl) s ->
+      Str.global_replace rgx repl s
+    end repls_rgx s
 
-let format_smt s =
-  "smt__" ^ escaped s
+let format_smt =
+  (* Escaping is pure; identifiers repeat heavily across an obligation
+     and across obligations, so memoize. *)
+  let memo = Hashtbl.create 1024 in
+  fun s ->
+    match Hashtbl.find_opt memo s with
+    | Some r -> r
+    | None ->
+        let r = "smt__" ^ escaped s in
+        Hashtbl.add memo s r;
+        r
 
 let adj cx v =
   let nm = format_smt v.core in
