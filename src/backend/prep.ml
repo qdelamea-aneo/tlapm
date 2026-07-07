@@ -41,6 +41,19 @@ let vprintf fmt =
 let app_sub f s x = match s with None -> x | Some s -> f s x
 let scons_sub e s = Some (scons e (Option.default (shift 0) s))
 
+(* One step of [expand_defs]: the fold state [(s, kept)] after hypothesis
+   [h], where [s] is the substitution accumulated so far and [kept] the
+   hypotheses kept so far. *)
+let expand_defs_step what (s, kept) h =
+  let h = app_sub app_hyp s h in
+  match h.core with
+  | Defn ({core = Operator (_, e)}, wd, Visible, _) when what wd ->
+      (scons_sub e s, kept)
+  | Defn ({core = Bpragma (_, e, _)}, wd, _, _) when what wd ->
+      (scons_sub e s, kept)
+  | _ ->
+      (Option.map bump s, Deque.snoc kept h)
+
 let expand_defs ?(what = fun _ -> true) ob =
   (* Inline the visible operator / pragma definitions of the obligation's
      context into the rest of the sequent.
@@ -54,21 +67,55 @@ let expand_defs ?(what = fun _ -> true) ob =
      so prior inlinings are already substituted into it -- exactly as in the
      iterated version.  The resulting obligation is identical. *)
   let sq = ob.obl.core in
-  let rec fold s kept cx = match Deque.front cx with
-    | None -> (s, kept)
-    | Some (h, hs) ->
-        let h = app_sub app_hyp s h in
-        begin match h.core with
-          | Defn ({core = Operator (_, e)}, wd, Visible, _) when what wd ->
-              fold (scons_sub e s) kept hs
-          | Defn ({core = Bpragma (_, e, _)}, wd, _, _) when what wd ->
-              fold (scons_sub e s) kept hs
-          | _ ->
-              fold (Option.map bump s) (Deque.snoc kept h) hs
-        end
-  in
-  let (s, context) = fold None Deque.empty sq.context in
+  let (s, context) =
+    Deque.fold_left (expand_defs_step what) (None, Deque.empty) sq.context in
   let active = app_sub app_expr s sq.active in
+  { ob with obl = { ob.obl with core = { context ; active } } }
+
+(* Cross-obligation cache for [expand_defs] (default [what] only, which is its
+   single call site, in [normalize_expr]).
+
+   All obligations of a module share a long, physically identical (==) context
+   prefix (the module-level scope; measured: the median obligation shares >99%
+   of its context with the previous one).  The fold state of [expand_defs]
+   after position [i] -- the substitution and the kept-hypotheses deque -- is a
+   pure function of hypotheses [0..i-1], so for the shared prefix it is the
+   same value as for the previous obligation and can be resumed instead of
+   recomputed.  Keying on physical equality makes stale hits impossible: nodes
+   from another module or a rebuilt context compare unshared and fall back to
+   a full (cache-refreshing) fold.  The cache pins the previous obligation's
+   context and fold snapshots; everything is substructure-shared, so the
+   footprint is one array of pairs. *)
+let expand_cache
+    : (hyp array * (Expr.Subst.sub option * hyp Deque.dq) array) ref
+  = ref ([||], [||])
+
+(* Length of the longest common prefix of [a] and [b], comparing elements
+   with physical equality. *)
+let shared_prefix_length a b =
+  let m = min (Array.length a) (Array.length b) in
+  let l = ref 0 in
+  while !l < m && a.(!l) == b.(!l) do incr l done;
+  !l
+
+let expand_defs_cached ob =
+  let what _ = true in
+  let sq = ob.obl.core in
+  let raw = Array.of_list (Deque.to_list sq.context) in
+  let n = Array.length raw in
+  let (craw, cstates) = !expand_cache in
+  let l = shared_prefix_length raw craw in
+  (* [states.(i)] is the fold state before hypothesis [i];
+     [states.(0)] is the initial state and [l + 1 <= Array.length cstates]
+     whenever [l > 0]. *)
+  let states = Array.make (n + 1) (None, Deque.empty) in
+  Array.blit cstates 0 states 0 (min (l + 1) (Array.length cstates));
+  for i = l to n - 1 do
+    states.(i + 1) <- expand_defs_step what states.(i) raw.(i)
+  done;
+  let (s, context) = states.(n) in
+  let active = app_sub app_expr s sq.active in
+  expand_cache := (raw, states);
   { ob with obl = { ob.obl with core = { context ; active } } }
 
 (*
@@ -286,6 +333,56 @@ let%test_module "expand_defs" = (module struct
     assert (result.fingerprint = ob.fingerprint);
     assert (result.kind = ob.kind);
     assert (result.obl.props == ob.obl.props)
+
+  (* [expand_defs_cached] must return the same obligation as [expand_defs],
+     whatever the previous obligation was.  The obligations below share the
+     physical prefix [CONSTANT x; A == x; fact A; H == A (hidden)], as the
+     obligations of one module do; [other] is built separately and shares
+     nothing with them. *)
+  let%test_unit "cache: shared, diverging, shorter contexts -> same result" =
+    let prefix = [
+      fresh "x";
+      operator "A" (ix 1);
+      fact (ix 1);
+      operator ~visibility:Hidden "H" (ix 2);
+    ] in
+    let ob1 = obligation (prefix @ [operator "B" (tuple [ix 1; ix 3])])
+        (tuple [ix 1; ix 2]) in
+    let ob2 = obligation (prefix @ [fact (ix 1); operator "C" (ix 4)])
+        (tuple [ix 1; ix 2; ix 5]) in
+    let ob3 = match prefix with
+      | x :: a :: _ -> obligation [x; a] (ix 1)
+      | _ -> assert false
+    in
+    let other = obligation [
+      fresh "x";
+      operator "A" (tuple [ix 1; ix 1]);
+      fact (ix 1);
+    ] (ix 2) in
+    expand_cache := ([||], [||]);
+    List.iter (fun ob ->
+      let expected = expand_defs ob in
+      let result = expand_defs_cached ob in
+      check_sequent result
+        (Deque.to_list expected.obl.core.context) expected.obl.core.active
+    ) [ob1; ob2; ob2; ob3; ob1; other; ob2; obligation [] (str "g")];
+    expand_cache := ([||], [||])
+
+  (* On a shared prefix, the cached fold resumes from the previous
+     obligation's state, so the kept hypotheses of the prefix are the very
+     nodes built for the previous obligation. *)
+  let%test_unit "cache: shared prefix -> kept hypotheses reused" =
+    let prefix = [operator "A" (str "a"); fact (ix 1); fresh "x"] in
+    let ob1 = obligation (prefix @ [fact (ix 1)]) (ix 1) in
+    let ob2 = obligation (prefix @ [fact (ix 2)]) (ix 2) in
+    expand_cache := ([||], [||]);
+    let r1 = expand_defs_cached ob1 in
+    let r2 = expand_defs_cached ob2 in
+    let first2 ob = Deque.to_list (Deque.first_n ob.obl.core.context 2) in
+    assert (List.for_all2 ( == ) (first2 r1) (first2 r2));
+    check_sequent r2 (Deque.to_list (expand_defs ob2).obl.core.context)
+      (expand_defs ob2).obl.core.active;
+    expand_cache := ([||], [||])
 
   (* n expanded operators and pragmas, then n hidden operators; goal TRUE. *)
   let%test_unit "complexity: doubled context -> allocation < 3x" =
@@ -1268,7 +1365,10 @@ let prune_context ob =
 let normalize_expr ob =
     print_obl_and_msg ob (
         "Proof obligation before `Backend.Prep.expand_defs`:\n");
-    let ob = expand_defs ob in
+    let ob =
+      if Params.debugging "noprepcache" then expand_defs ob
+      else expand_defs_cached ob
+    in
     print_obl_and_msg ob (
         "Proof obligation after `Backend.Prep.expand_defs` and " ^
         "before `Expr.Elab.normalize`:\n");
@@ -1669,6 +1769,16 @@ let compute_meth def args usept =
   meth
 
 
+(* Stabilizer for the two [find_meth] branches that rebuild a hypothesis with
+   the properties of the defined operator's NAME node (the historical
+   behavior, which downstream code may rely on).  The rebuild is a pure
+   per-node function, but a fresh node per obligation would break the
+   physical (==) sharing of the context prefix across obligations that the
+   preparation caches depend on, so the node rebuilt for the previous
+   obligation is reused whenever the input node at the same position is
+   physically the same. *)
+let find_meth_stable : (hyp array * hyp array) ref = ref ([||], [||])
+
 let find_meth ob =
   match query ob.obl Proof.T.Props.meth with
   | Some _ -> ob
@@ -1676,21 +1786,35 @@ let find_meth ob =
      let meths = ref [] in
      let use_loc = ref Loc.unknown in
      let stack : (meth_or_premeth option) list ref = ref [] in
+     let raw = Array.of_list (Deque.to_list ob.obl.core.context) in
+     let (cin, cout) = !find_meth_stable in
+     let out = Array.copy raw in
+     let stable i rebuild =
+       let h' =
+         if i < Array.length cin && raw.(i) == cin.(i) then cout.(i)
+         else rebuild ()
+       in
+       out.(i) <- h';
+       h'
+     in
      let f n h =
        match h.core with
-       | Fact ({core = With (_, m)} as fac, Visible, tm) -> (* FIXME remove *)
+       | Fact ({core = With (_, m)}, Visible, _) -> (* FIXME remove *)
           meths := [m] :: !meths ;
           stack := None :: !stack;
-          Fact (fac, Visible, tm) @@ h
-       | Defn ({core = Bpragma (h, e, l)} as def,
+          h
+       | Defn ({core = Bpragma (nm, _, l)} as def,
                 wheredef, visibility, export) ->
            stack := Some (Premeth (l)) :: !stack;
-           Defn (def, wheredef, visibility, export) @@ h
-       | Fact ({core = Apply ({core = Ix n}, ll)} as fac, Visible, tm) ->
+           (* NB: rebuilt with the props of the pragma NAME node, as the
+              original (shadowed) code did -- downstream reads them *)
+           stable n (fun () ->
+             Defn (def, wheredef, visibility, export) @@ nm)
+       | Fact ({core = Apply ({core = Ix n}, ll)} as fac, Visible, _) ->
           begin match List.nth !stack (n-1) with
           | None ->
              stack := None :: !stack;
-             Fact (fac, Visible, tm) @@ h
+             h
           | Some (Premeth (l)) ->
              if Property.get h Proof.T.Props.use_location != !use_loc then begin
                meths := [];
@@ -1699,22 +1823,23 @@ let find_meth ob =
              let f x = compute_meth x ll fac in
              meths := (List.map f l) :: !meths;
              stack := None :: !stack;
-             Fact (fac, Visible, tm) @@ h
+             h
           | Some (Meth _) -> assert false  (* FIXME remove *)
           end
-       | Defn ({core = Operator (h, {core = With (exp, m)})} as def,
+       | Defn ({core = Operator (nm, {core = With (_, m)})} as def,
                wheredef, Visible, export) ->  (* FIXME remove *)
           stack := Some (Meth m) :: !stack;
-          Defn (def, wheredef, Visible, export) @@ h
-       | Fact ({core = Ix n} as fac, Visible, tm) ->
+          stable n (fun () ->
+            Defn (def, wheredef, Visible, export) @@ nm)
+       | Fact ({core = Ix n} as fac, Visible, _) ->
           begin match List.nth !stack (n-1) with
           | None ->
              stack := None :: !stack;
-             Fact (fac, Visible, tm) @@ h
+             h
           | Some (Meth m) ->          (* FIXME remove *)
              meths := [m] :: !meths;
              stack := None :: !stack;
-             Fact (fac, Visible, tm) @@ h  (* was `Hidden` *)
+             h  (* was `Hidden` *)
           | Some (Premeth (l)) ->
              if Property.get h Proof.T.Props.use_location != !use_loc then begin
                meths := [];
@@ -1723,13 +1848,14 @@ let find_meth ob =
              let f x = compute_meth x [] fac in
              meths := (List.map f l) :: !meths;
              stack := None :: !stack;
-             Fact (fac, Visible, tm) @@ h
+             h
           end
        | _ ->
           stack := None :: !stack;
           h
      in
      let cx = Deque.map f ob.obl.core.context in
+     find_meth_stable := (raw, out);
      let meths =
         match !meths with
         | [] -> !Params.default_method
@@ -1784,7 +1910,7 @@ let really_ship ob org_ob meth fpout thyout record =
 
 
 (* TODO: constness visitor also called in frontends *)
-let add_constness ob =
+let add_constness_nocache ob =
   let e = noprops (Expr.T.Sequent ob.obl.core) in
   let visitor = object (self: 'self)
     inherit Expr.Constness.const_visitor
@@ -1792,6 +1918,51 @@ let add_constness ob =
   match visitor#expr ((), Deque.empty) e with
   | {core = Expr.T.Sequent sq} -> {ob with obl = sq @@ ob.obl}
   | _ -> assert false
+
+(* Cross-obligation cache for [add_constness], same principle as
+   [expand_defs_cached]: the constness annotation of a hypothesis is a pure
+   function of the raw hypothesis and the annotated hypotheses preceding it
+   (the visitor state is exactly the deque of already-annotated hypotheses,
+   cf. [Expr.Visit.map#hyp], which adjoins the *mapped* hypothesis), so the
+   annotated prefix cached from the previous obligation can be reused for the
+   physically shared (==) part of the context.
+
+   Equivalence with [add_constness_nocache]: that function feeds the sequent
+   through [const_visitor#expr], whose [Sequent] case is
+   [super#sequent] = [#hyps] on the context then [#expr] on the active
+   (mirrored here), plus an [isconst] annotation on the *outer* sequent node,
+   which [add_constness_nocache] discards (it keeps only the inner sequent).
+   Reusing cached annotated hypotheses also restores physical sharing of the
+   context across obligations downstream, which is what makes
+   [expand_defs_cached] effective. *)
+let constness_cache : (Expr.T.hyp array * Expr.T.hyp list) ref = ref ([||], [])
+
+let add_constness ob =
+  if Params.debugging "noprepcache" then add_constness_nocache ob
+  else begin
+    let sq = ob.obl.core in
+    let raw = Array.of_list (Deque.to_list sq.context) in
+    let n = Array.length raw in
+    let (craw, cann) = !constness_cache in
+    let l = shared_prefix_length raw craw in
+    let rec take k lst =
+      if k = 0 then []
+      else match lst with
+        | x :: xs -> x :: take (k - 1) xs
+        | [] -> assert false
+    in
+    let ann_prefix = take l cann in
+    let visitor = object (self: 'self)
+      inherit Expr.Constness.const_visitor
+    end in
+    let scx = ((), Deque.of_list ann_prefix) in
+    let suffix = Deque.of_list (Array.to_list (Array.sub raw l (n - l))) in
+    let (scx, ann_suffix) = visitor#hyps scx suffix in
+    let context = Deque.append (Deque.of_list ann_prefix) ann_suffix in
+    let active = visitor#expr scx sq.active in
+    constness_cache := (raw, Deque.to_list context);
+    {ob with obl = { context ; active } @@ ob.obl}
+  end
 
 
 let is_success st =
