@@ -958,13 +958,18 @@ let prune_context ob =
      and the facts, and drops the rest, renumbering with the same
      substitution machinery as `expand_defs`.
 
-     Only UNREFERENCED HIDDEN operator/pragma definitions are dropped: a hidden
-     definition is an opaque declaration, so when nothing (transitively) refers
-     to it the backends never see it, and dropping it preserves provability.
-     Everything else is kept -- all declarations (`Fresh`/`Flex`/`FreshTuply`),
-     recursive/instance definitions, and ALL facts (including hidden ones, which
-     remain available as premises and were found to be needed); un-analyzable
-     hypotheses conservatively keep all their predecessors.
+     Only UNREFERENCED HIDDEN hypotheses are dropped, of two kinds: hidden
+     operator/pragma definitions (opaque declarations: when nothing
+     transitively refers to one, the backends never see it) and hidden facts
+     (a fact is hidden here only when the obligation does not cite it -- a
+     `BY`/`USE` citation marks it Visible during proof generation, before this
+     pass -- and the backend translations only assert visible facts, so an
+     unreferenced hidden fact is dead weight carried through every backend
+     encoding pass; dropping a premise can also never turn an unprovable
+     sequent provable).  Everything else is kept -- all declarations
+     (`Fresh`/`Flex`/`FreshTuply`), recursive/instance definitions, visible or
+     referenced hypotheses; un-analyzable hypotheses conservatively keep all
+     their predecessors.
 
      Self-checking: a dropped slot is filled with a distinctive
      `Opaque "__pruned__"`.  Because dropped hypotheses are unreachable, it
@@ -984,10 +989,12 @@ let prune_context ob =
         fv
     in
     let mark_all_before p = for q = 0 to p - 1 do keep.(q) <- true done in
-    (* seed: keep everything except hidden operator/pragma definitions *)
+    (* seed: keep everything except hidden operator/pragma definitions and
+       hidden (uncited) facts *)
     for p = 0 to n - 1 do
       (match arr.(p).core with
         | Defn ({core = (Operator _ | Bpragma _)}, _, Hidden, _) -> ()
+        | Fact (_, Hidden, _) -> ()
         | _ -> keep.(p) <- true)
     done;
     (* the goal references hypotheses at any depth *)
@@ -1117,12 +1124,11 @@ let normalize_expand ob fpout thyout record
             ~apply_lambdify:apply_lambdify
             ~enabled_axioms:enabled_axioms
             ~level_comparison:level_comparison in
-        (* Prune unreachable hidden definitions only after every expansion
-           (`expand_defs`, `Expr.Elab.normalize`, and the ENABLED/`\cdot`
-           expansion above) has introduced its references, so that nothing
-           still needed -- in particular by the ENABLED/`\cdot` soundness
-           machinery -- is dropped. *)
-        let ob = prune_context ob in
+        (* NOTE: context pruning happens later, on the backend path only
+           (see `frontend_ob` in `ship`): the triviality check consumes this
+           function's result and discharges support obligations by finding a
+           fact -- hidden ones included -- equal to the goal, so pruning here
+           would lose those premises. *)
         (ob, true)
     with Failure msg ->
         (* `msg` is the message from soundness checks,
@@ -1639,15 +1645,20 @@ let ship ob fpout thyout record =
         | None -> Schedule.Immediate has_success
         | Some meth ->
            let frontend_ob =
+             (* Prune the context only on the backend path: it must happen
+                after every expansion (`expand_defs`, `Expr.Elab.normalize`,
+                the ENABLED/`\cdot` machinery) has introduced its references,
+                and after the triviality check, which can discharge a support
+                obligation from a hidden fact equal to the goal. *)
              match meth with
              (* The obligations sent to FOL backends are normalized using the
               * action frontend by default *)
              | Method.LS4 _ ->
                  lazy (Pltl.process_obligation
-                           (Lazy.force normalize_expand_ob))
+                           (prune_context (Lazy.force normalize_expand_ob)))
              | _ ->
                  lazy (Action.process_obligation
-                           (Lazy.force normalize_expand_ob))
+                           (prune_context (Lazy.force normalize_expand_ob)))
            in
            let tmo = !Params.backend_timeout *. !Params.timeout_stretch in
            print_obl_and_msg
