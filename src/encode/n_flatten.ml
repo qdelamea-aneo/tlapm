@@ -585,8 +585,12 @@ let main sq =
         let h = Fact (e, Visible, tm) @@ h in
         let gtx = Deque.fold_left global_adj gtx hs' in
         let gtx = global_adj gtx h in
-        let shift = Subst.shift (Deque.size hs') in
-        let hs = snd (subst#hyps shift hs) in
+        (* no new blueprint hypotheses: shift 0 would rebuild every
+           remaining hypothesis for nothing *)
+        let hs =
+          if Deque.null hs' then hs
+          else snd (subst#hyps (Subst.shift (Deque.size hs')) hs)
+        in
         spin bps gtx hs
     | Some (h, hs) ->
         let gtx = global_adj gtx h in
