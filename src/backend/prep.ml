@@ -378,7 +378,11 @@ let flatten ob =
             prefix := Deque.snoc !prefix (Fact (app_expr (shift (n + k)) eq, Visible, tm) @@ h)
         end eqs ;
         let sq = { sq with context = cx } in
-        let sq = app_sequent (shift (List.length eqs + k - 1)) sq in
+        (* shift 0 is the common no-equalities-extracted case: skip the
+           full sequent rebuild (the input is beta-normal here, so the
+           rebuild is the identity) *)
+        let m = List.length eqs + k - 1 in
+        let sq = if m = 0 then sq else app_sequent (shift m) sq in
         rewrite sq
       end
     | Some (h, cx) ->
