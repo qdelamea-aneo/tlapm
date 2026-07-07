@@ -1187,6 +1187,84 @@ let obl_from_expr
     | _ -> failwith "Backend.Prep.obl_from_expr"
 
 
+let prune_context ob =
+  (* Drop the hidden facts that the obligation cannot reach.
+
+     An obligation carries every fact in scope -- on INSTANCE-heavy specs,
+     hundreds of instantiated theorem statements -- although it cites only a
+     few of them.  A fact is Hidden here exactly when the obligation does not
+     cite it (a `BY`/`USE` citation marks it Visible during proof generation,
+     before this pass), and the backend translations only assert visible
+     facts.  An unreferenced hidden fact therefore never reaches a prover, but
+     its body is carried through every whole-sequent pass of the backend
+     preparation and encoders, which is where the time goes on large
+     contexts.
+
+     This pass drops the hidden facts that are not transitively reachable,
+     via de Bruijn references, from the goal or from a kept hypothesis, and
+     renumbers the rest with the same substitution machinery as `expand_defs`
+     (`bump` to keep a hypothesis, `scons` to drop one).  Everything else is
+     kept: all declarations and definitions, hidden ones included, and the
+     visible or referenced facts; hypotheses whose references are not
+     analyzed conservatively keep all their predecessors.  Hidden definitions
+     are deliberately kept although they are opaque: the SMT encoding
+     declares them as uninterpreted symbols, and removing unused declarations
+     changes Z3's quantifier-instantiation heuristics enough to lose proofs
+     (e.g. examples/Dekker/Dekker.tla line 224, examples/paxos/Paxos.tla
+     line 410).  With only hidden facts dropped, the solver inputs are the
+     same as without this pass.
+
+     Self-checking: a dropped slot is filled with a distinctive
+     `Opaque "__pruned__"`.  Because dropped hypotheses are unreachable, it
+     never appears in the result; a reachability bug would surface as that
+     opaque leaking into an obligation (a failing proof), never as a silent
+     miscompilation. *)
+  let sq = ob.obl.core in
+  let n = Deque.size sq.context in
+  if n = 0 then ob else begin
+    let arr = Array.of_list (Deque.to_list sq.context) in  (* arr.(0) = front *)
+    let keep = Array.make n false in
+    let mark m fv =
+      (* mark the positions referenced by free indices `fv` of a node whose
+         enclosing context has size `m` (de Bruijn index k -> position m - k) *)
+      Util.Coll.Is.iter
+        (fun k -> let pos = m - k in if pos >= 0 && pos < n then keep.(pos) <- true)
+        fv
+    in
+    let mark_all_before p = for q = 0 to p - 1 do keep.(q) <- true done in
+    (* seed: keep everything except hidden (uncited) facts *)
+    for p = 0 to n - 1 do
+      (match arr.(p).core with
+        | Fact (_, Hidden, _) -> ()
+        | _ -> keep.(p) <- true)
+    done;
+    (* the goal references hypotheses at any depth *)
+    mark n (Expr.Collect.fvs sq.active);
+    (* close: references point strictly front-ward, so one rear-to-front pass
+       reaches the transitive closure *)
+    for p = n - 1 downto 0 do
+      if keep.(p) then begin
+        match arr.(p).core with
+          | Defn ({core = Operator (_, e)}, _, _, _)
+          | Defn ({core = Bpragma (_, e, _)}, _, _, _) -> mark p (Expr.Collect.fvs e)
+          | Fact (e, _, _) -> mark p (Expr.Collect.fvs e)
+          | Fresh (_, _, _, Bounded (dom, _)) -> mark p (Expr.Collect.fvs dom)
+          | Fresh _ | Flex _ | Defn ({core = Recursive _}, _, _, _) -> ()
+          | _ -> mark_all_before p
+      end
+    done;
+    (* rebuild: `bump s` under a kept hypothesis, `scons placeholder s` to drop *)
+    let rec fold s i kept cx = match Deque.front cx with
+      | None -> (s, kept)
+      | Some (h, hs) ->
+          if keep.(i) then fold (bump s) (i + 1) (Deque.snoc kept (app_hyp s h)) hs
+          else fold (scons (Opaque "__pruned__" @@ h) s) (i + 1) kept hs
+    in
+    let (s, context) = fold (shift 0) 0 Deque.empty sq.context in
+    let active = app_expr s sq.active in
+    { ob with obl = { ob.obl with core = { context ; active } } }
+  end
+
 let normalize_expr ob =
     print_obl_and_msg ob (
         "Proof obligation before `Backend.Prep.expand_defs`:\n");
@@ -1287,6 +1365,11 @@ let normalize_expand ob fpout thyout record
             ~apply_lambdify:apply_lambdify
             ~enabled_axioms:enabled_axioms
             ~level_comparison:level_comparison in
+        (* NOTE: context pruning happens later, on the backend path only
+           (see `frontend_ob` in `ship`): the triviality check consumes this
+           function's result and discharges support obligations by finding a
+           fact -- hidden ones included -- equal to the goal, so pruning here
+           would lose those premises. *)
         (ob, true)
     with Failure msg ->
         (* `msg` is the message from soundness checks,
@@ -1855,15 +1938,20 @@ let ship ob fpout thyout record =
         | None -> Schedule.Immediate has_success
         | Some meth ->
            let frontend_ob =
+             (* Prune the context only on the backend path: it must happen
+                after every expansion (`expand_defs`, `Expr.Elab.normalize`,
+                the ENABLED/`\cdot` machinery) has introduced its references,
+                and after the triviality check, which can discharge a support
+                obligation from a hidden fact equal to the goal. *)
              match meth with
              (* The obligations sent to FOL backends are normalized using the
               * action frontend by default *)
              | Method.LS4 _ ->
                  lazy (Pltl.process_obligation
-                           (Lazy.force normalize_expand_ob))
+                           (prune_context (Lazy.force normalize_expand_ob)))
              | _ ->
                  lazy (Action.process_obligation
-                           (Lazy.force normalize_expand_ob))
+                           (prune_context (Lazy.force normalize_expand_ob)))
            in
            let tmo = !Params.backend_timeout *. !Params.timeout_stretch in
            print_obl_and_msg
